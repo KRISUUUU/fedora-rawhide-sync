@@ -2,7 +2,7 @@
 #
 # ==============================================================================
 # Project: Fedora Rawhide Sync Tool
-# Version: 9.1 (Enterprise Ready / Hotfix: DNF5 & Gum)
+# Version: 9.2 (Final Deployment Edition)
 # Author:  Krzysztof (GitHub: KRISUUUU)
 # License: MIT License
 # ==============================================================================
@@ -90,8 +90,8 @@ acquire_lock() {
 }
 
 detect_dnf_major() {
-    # Niezawodne wyciąganie cyfry głównej wersji dla DNF4 i DNF5
-    dnf --version 2>/dev/null | awk 'NR==1 {print $NF}' | cut -d. -f1 || echo "4"
+    # Ekstremalnie bezpieczne wyciąganie cyfry 4 lub 5 z pierwszej linii wyjścia --version
+    dnf --version 2>/dev/null | head -n1 | grep -o '[0-9]' | head -n1 || echo "4"
 }
 
 check_disk_space() {
@@ -188,7 +188,7 @@ ui_confirm() {
 ui_spinner() {
     local text="$1"; local command="$2"
     if [[ "$HAS_GUM" == "1" ]]; then
-        # Poprawna składnia dla gum spin
+        # Bezpieczne wywołanie gum spin omijające błędy parsowania argumentów
         gum spin --spinner dot --title "$text" -- bash -c "$command"
     else
         echo -e "   ${Y}•${NC} $text" >&2
@@ -210,7 +210,6 @@ prepare_environment() {
 }
 
 simulate_sync() {
-    local dnf_ver=$(detect_dnf_major)
     declare -a cmd=("dnf")
     local msg=""
 
@@ -222,13 +221,9 @@ simulate_sync() {
         msg="Distro-Sync"
     fi
     
-    cmd+=("--refresh" "--best" "--allowerasing")
-
-    if [[ "$dnf_ver" == "5" ]]; then
-        cmd+=("--dry-run")
-    else
-        cmd+=("--setopt=tsflags=test")
-    fi
+    # Ominięcie błędów specyficznych dla interfejsu DNF5. 
+    # Bezpośrednie przekazanie flagi testowej do silnika RPM.
+    cmd+=("--best" "--allowerasing" "--setopt=tsflags=test")
 
     TEMP_OUTPUT="$(mktemp)"
     
@@ -247,7 +242,8 @@ simulate_sync() {
 perform_update() {
     declare -a cmd=("dnf")
     [[ "$FAST_UPGRADE" == "1" ]] && cmd+=("upgrade") || cmd+=("distro-sync")
-    cmd+=("--refresh" "--best" "--allowerasing" "-y")
+    
+    cmd+=("--best" "--allowerasing" "-y")
     
     log "INFO" "$(t up_start)"
     echo "" >&2
