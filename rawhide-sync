@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+#
+# ==============================================================================
+# Project: Fedora Rawhide Sync Tool
+# Version: 9.0 (Enterprise Ready / Secure Edition)
+# Author:  Krzysztof (GitHub: KRISUUUU)
+# License: MIT License
+# ==============================================================================
+
+readonly LOG_FILE="/var/log/rawhide_sync.log"
+readonly LOCK_FILE="/run/lock/rawhide_sync/rawhide_sync.lock"
+readonly DATE_FORMAT="+%Y-%m-%d %H:%M:%S"
+readonly MIN_DISK_SPACE_MB=2048
+readonly LANG_DEFAULT="PL"
+
+# --- Zmienne globalne ---
+TEMP_OUTPUT=""
+MODE="prompt"
+FAST_UPGRADE="0"
+CURRENT_LANG="$LANG_DEFAULT"
+HAS_GUM=0
+
+if command -v gum &> /dev/null; then HAS_GUM=1; fi
+
+# --- UI Colors & Chars (dla Classic) ---
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'
+M='\033[0;35m'; C='\033[0;36m'; W='\033[1;37m'; D='\033[0;90m'; NC='\033[0m'
+
+# --- Słownik ---
+declare -A MSG_PL MSG_EN
+MSG_PL[menu_title]="PANEL STEROWANIA RAWHIDE"
+MSG_PL[opt_1]="TEST TRANSAKCJI (Symulacja / Bezpieczne)"
+MSG_PL[opt_2]="PEŁNA SYNCHRONIZACJA (distro-sync)"
+MSG_PL[opt_3]="AKTUALIZACJA (Bez downgrade / Opcjonalne)"
+MSG_PL[opt_4]="TYLKO UPDATE (Pomiń test / Ryzykowne)"
+MSG_PL[opt_L]="ZMIEŃ JĘZYK / LANGUAGE"
+MSG_PL[opt_5]="WYJŚCIE"
+MSG_PL[info_env]="Weryfikacja środowiska (DNF v%s)"
+MSG_PL[error_root]="Wymagany ROOT (sudo)"
+MSG_PL[error_disk]="Brak miejsca na dysku (wymagane %s MB w /var)"
+MSG_PL[sim_start]="Symulacja: %s..."
+MSG_PL[sim_ok]="Test OK. Brak konfliktów."
+MSG_PL[sim_fail]="Błąd Testu Transakcji!"
+MSG_PL[up_start]="Rozpoczynam aktualizację..."
+MSG_PL[up_ok]="System zaktualizowany pomyślnie!"
+MSG_PL[reboot]="!!! WYMAGANY RESTART SYSTEMU !!!"
+MSG_PL[confirm_up]="Test OK. Kontynuować aktualizację?"
+
+MSG_EN[menu_title]="RAWHIDE CONTROL PANEL"
+MSG_EN[opt_1]="TRANSACTION TEST (Simulation / Safe)"
+MSG_EN[opt_2]="FULL SYNCHRONIZATION (distro-sync)"
+MSG_EN[opt_3]="UPGRADE (No downgrade / Optional)"
+MSG_EN[opt_4]="UPDATE ONLY (Skip test / Risky)"
+MSG_EN[opt_L]="CHANGE LANGUAGE / JĘZYK"
+MSG_EN[opt_5]="EXIT"
+MSG_EN[info_env]="Environment Check (DNF v%s)"
+MSG_EN[error_root]="ROOT Required (sudo)"
+MSG_EN[error_disk]="Insufficient disk space (need %s MB in /var)"
+MSG_EN[sim_start]="Simulation: %s..."
+MSG_EN[sim_ok]="Test OK. No conflicts."
+MSG_EN[sim_fail]="Transaction Test Failed!"
+MSG_EN[up_start]="Starting update..."
+MSG_EN[up_ok]="System updated successfully!"
+MSG_EN[reboot]="!!! SYSTEM REBOOT REQUIRED !!!"
+MSG_EN[confirm_up]="Test OK. Proceed with update?"
+
+t() {
+    local key="$1"; shift
+    local tmpl
+    [[ "$CURRENT_LANG" == "PL" ]] && tmpl="${MSG_PL[$key]:-MISSING}" || tmpl="${MSG_EN[$key]:-MISSING}"
+    [[ $# -gt 0 ]] && printf "$tmpl" "$@" || echo -n "$tmpl"
+}
+
+# --- Funkcje Systemowe ---
+
+cleanup() { [[ -n "${TEMP_OUTPUT}" && -f "${TEMP_OUTPUT}" ]] && rm -f "${TEMP_OUTPUT}" || true; }
+check_root() { if [[ "${EUID}" -ne 0 ]]; then echo "$(t error_root)"; exit 1; fi; }
+
+init_logfile() { 
+    local dir
+    dir="$(dirname "$LOG_FILE")"
+    [[ ! -d "$dir" ]] && mkdir -p "$dir" 2>/dev/null
+    touch "$LOG_FILE" 2>/dev/null || true
+    chmod 600 "$LOG_FILE" 2>/dev/null || true
+}
+
+acquire_lock() {
+    local ld="$(dirname "$LOCK_FILE")"; [[ ! -d "$ld" ]] && mkdir -p "$ld" 2>/dev/null
+    exec 200>"$LOCK_FILE"; if ! flock -n 200; then log "ERROR" "LOCKED - Another instance is running"; exit 1; fi
+}
+
+detect_dnf_major() {
+    dnf --version 2>/dev/null | awk 'NR==1 { split($1, a, "."); print a[1]; exit }' || echo "4"
+}
+
+check_disk_space() {
+    local available_kb
+    available_kb=$(df -k /var 2>/dev/null | awk 'NR==2 {print $4}')
+    [[ -z "$available_kb" ]] && return 0 # Fallback if df fails
+    
+    local required_kb=$((MIN_DISK_SPACE_MB * 1024))
+    if [[ "$available_kb" -lt "$required_kb" ]]; then
+        log "ERROR" "$(t error_disk "$MIN_DISK_SPACE_MB")"
+        return 1
+    fi
+    return 0
+}
+
+# --- Warstwa Logowania i UI ---
+
+log() {
+    local level="$1"; local msg="$2"; local c=$NC; local icon="•"
+    case "$level" in "INFO") c=$G; icon="✔" ;; "WARN") c=$Y; icon="!" ;; "ERROR") c=$R; icon="✘" ;; esac
+    
+    if [[ "$HAS_GUM" == "1" ]]; then
+        case "$level" in
+            "INFO")  gum style --foreground 212 " ✔ $msg" >&2 ;;
+            "WARN")  gum style --foreground 214 " ! $msg" >&2 ;;
+            "ERROR") gum style --foreground 196 " ✘ $msg" >&2 ;;
+        esac
+    else
+        printf "   ${c}${icon}${NC} %s\n" "$msg" >&2
+    fi
+
+    if [[ -w "$LOG_FILE" ]]; then
+        local ts=$(date "$DATE_FORMAT")
+        local clean=$(echo "$msg" | sed 's/\x1b\[[0-9;]*m//g')
+        echo "[$ts] [$level] $clean" >> "$LOG_FILE" || true
+    fi
+}
+
+ui_banner() {
+    clear || true
+    if [[ "$HAS_GUM" == "1" ]]; then
+        gum style --foreground 212 --border-foreground 212 --border double --align center --width 60 --margin "1 2" --padding "1 2" \
+            "KRISUUUU" "Fedora Rawhide Sync" >&2
+    else
+        echo -e "${C}${W}" >&2
+        cat << "EOF" >&2
+  _  __ ____  ___  ____   _   _  _   _  _   _  _   _ 
+ | |/ /|  _ \|_ _|| ___| | | | || | | || | | || | | |
+ | ' / | |_) || | \___ \ | | | || | | || | | || | | |
+ | . \ |  _ < | |  ___) || |_| || |_| || |_| || |_| |
+ |_|\_\|_| \_\___||____/  \___/  \___/  \___/  \___/ 
+EOF
+        echo -e "${NC}\n${M}                  :: FEDORA RAWHIDE SYNC ::${NC}\n" >&2
+    fi
+}
+
+ui_menu() {
+    if [[ "$HAS_GUM" == "1" ]]; then
+        # Gum obsługuje renderowanie wewnętrznie
+        local choice
+        choice=$(gum choose --header="$(t menu_title)" \
+            "1) $(t opt_1)" "2) $(t opt_2)" "3) $(t opt_3)" "4) $(t opt_4)" "L) $(t opt_L)" "5) $(t opt_5)")
+        echo "${choice:0:1}"
+    else
+        # FIX: Cały interfejs wypisujemy na stderr (>&2), aby na stdout poszedł tylko wynik (echo)
+        echo -e " ${G}┌─ SAFE ZONE ──────────────────────────────────────────┐${NC}" >&2
+        printf " ${G}│${NC}  ${W}[1]${NC} %-48s ${G}│${NC}\n" "$(t opt_1)" >&2
+        printf " ${G}│${NC}  ${W}[2]${NC} %-48s ${G}│${NC}\n" "$(t opt_2)" >&2
+        echo -e " ${G}└──────────────────────────────────────────────────────┘${NC}" >&2
+        echo -e " ${R}┌─ DANGER ZONE ────────────────────────────────────────┐${NC}" >&2
+        printf " ${R}│${NC}  ${W}[3]${NC} %-48s ${R}│${NC}\n" "$(t opt_3)" >&2
+        printf " ${R}│${NC}  ${W}[4]${NC} %-48s ${R}│${NC}\n" "$(t opt_4)" >&2
+        echo -e " ${R}└──────────────────────────────────────────────────────┘${NC}" >&2
+        echo -e " ${B}┌─ SYSTEM ─────────────────────────────────────────────┐${NC}" >&2
+        printf " ${B}│${NC}  ${W}[L]${NC} %-48s ${B}│${NC}\n" "$(t opt_L)" >&2
+        printf " ${B}│${NC}  ${W}[5]${NC} %-48s ${B}│${NC}\n" "$(t opt_5)" >&2
+        echo -e " ${B}└──────────────────────────────────────────────────────┘${NC}\n" >&2
+        
+        echo -e -n "${W}Wybor > ${NC}" >&2
+        read -r classic_choice < /dev/tty
+        echo "$classic_choice"
+    fi
+}
+
+ui_confirm() {
+    local text="$1"
+    if [[ "$HAS_GUM" == "1" ]]; then
+        gum confirm "$text" && return 0 || return 1
+    else
+        echo -e -n "\n${C}$text [y/N]: ${NC}" >&2
+        read -r confirm < /dev/tty
+        [[ "$confirm" =~ ^([yYtT]([eE][sS])?)$ ]] && return 0 || return 1
+    fi
+}
+
+ui_spinner() {
+    local text="$1"; local command="$2"
+    if [[ "$HAS_GUM" == "1" ]]; then
+        eval "$command" | gum spin --spinner dot --title "$text"
+    else
+        echo -e "   ${Y}•${NC} $text" >&2
+        eval "$command" > /dev/null
+    fi
+}
+
+# --- Logika domenowa (DNF) ---
+
+prepare_environment() {
+    log "INFO" "$(t info_env "$(detect_dnf_major)")"
+    check_disk_space || return 1
+    
+    if ! ui_spinner "Pobieranie metadanych..." "dnf makecache --refresh"; then
+        log "ERROR" "Błąd repozytoriów. Sprawdź połączenie z siecią."
+        return 1
+    fi
+    return 0
+}
+
+simulate_sync() {
+    local dnf_ver=$(detect_dnf_major)
+    declare -a cmd=("dnf")
+    local msg=""
+
+    if [[ "$FAST_UPGRADE" == "1" ]]; then
+        cmd+=("upgrade")
+        msg="Upgrade"
+    else
+        cmd+=("distro-sync")
+        msg="Distro-Sync"
+    fi
+    
+    cmd+=("--refresh" "--best" "--allowerasing")
+
+    if [[ "$dnf_ver" == "5" ]]; then
+        cmd+=("--dry-run")
+    else
+        cmd+=("--setopt=tsflags=test")
+    fi
+
+    TEMP_OUTPUT="$(mktemp)"
+    
+    if ! ui_spinner "$(t sim_start "$msg")" "${cmd[*]} &> $TEMP_OUTPUT"; then
+        log "ERROR" "$(t sim_fail)"
+        cat "$TEMP_OUTPUT" >&2
+        rm -f "$TEMP_OUTPUT"
+        return 1
+    fi
+    
+    log "INFO" "$(t sim_ok)"
+    rm -f "$TEMP_OUTPUT"
+    return 0
+}
+
+perform_update() {
+    declare -a cmd=("dnf")
+    [[ "$FAST_UPGRADE" == "1" ]] && cmd+=("upgrade") || cmd+=("distro-sync")
+    cmd+=("--refresh" "--best" "--allowerasing" "-y")
+    
+    log "INFO" "$(t up_start)"
+    echo "" >&2
+    
+    if "${cmd[@]}"; then
+        echo "" >&2
+        log "INFO" "$(t up_ok)"
+        ui_spinner "Czyszczenie pozostałości..." "dnf autoremove -y &>/dev/null; dnf clean all &>/dev/null"
+        return 0
+    else
+        log "ERROR" "BŁĄD KRYTYCZNY DNF!"
+        return 1
+    fi
+}
+
+check_restart_required() {
+    local dnf_ver=$(detect_dnf_major)
+    declare -a needs_cmd=("dnf")
+    [[ "$dnf_ver" == "5" ]] && needs_cmd+=("needs-restarting") || needs_cmd+=("needs-restarting" "-r")
+    
+    "${needs_cmd[@]}" &> /dev/null
+    if [[ $? -eq 1 ]]; then
+        if [[ "$HAS_GUM" == "1" ]]; then
+            echo "" >&2
+            gum style --foreground 0 --background 196 --bold --padding "1 2" --margin "1 1" "$(t reboot)" >&2
+        else
+            echo -e "\n${R}${W} $(t reboot) ${NC}\n" >&2
+        fi
+    fi
+}
+
+switch_language() { [[ "$CURRENT_LANG" == "PL" ]] && CURRENT_LANG="EN" || CURRENT_LANG="PL"; }
+
+main() {
+    trap cleanup EXIT
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --test-only) MODE="test-only"; shift ;;
+            --full) MODE="full"; shift ;;
+            --fast-upgrade) FAST_UPGRADE="1"; shift ;;
+            --lang) CURRENT_LANG="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    # Jeśli nie ma TTY (np. cron), a nie wybrano flagi, przerywamy z błędem dla bezpieczeństwa
+    if [[ ! -t 0 && "$MODE" == "prompt" ]]; then
+        log "ERROR" "Non-interactive mode requires explicit flag (e.g. --full)"
+        exit 1
+    fi
+
+    check_root
+    init_logfile
+    acquire_lock
+    
+    if [[ "$MODE" == "prompt" ]]; then
+        while true; do
+            ui_banner
+            local choice
+            choice=$(ui_menu)
+            case "$choice" in
+                1) MODE="test-only"; break ;;
+                2) MODE="full"; break ;;
+                3) MODE="full"; FAST_UPGRADE="1"; break ;;
+                4) MODE="update-only"; break ;;
+                [lL]) switch_language ;;
+                5) exit 0 ;;
+            esac
+        done
+    fi
+
+    ui_banner
+    if prepare_environment; then
+        case "$MODE" in
+            test-only) simulate_sync ;;
+            full) 
+                if simulate_sync; then
+                    if [[ -t 0 ]]; then
+                        if ui_confirm "$(t confirm_up)"; then
+                            perform_update && check_restart_required
+                        fi
+                    else
+                        # Non-interactive z flagą --full (odpala bez potwierdzenia)
+                        perform_update && check_restart_required
+                    fi
+                fi
+                ;;
+            update-only) 
+                if [[ -t 0 ]]; then
+                    if ui_confirm "Pominąć test (NIEBEZPIECZNE)?"; then
+                        perform_update && check_restart_required
+                    fi
+                else
+                    perform_update && check_restart_required
+                fi
+                ;;
+        esac
+    fi
+}
+
+main "$@"
