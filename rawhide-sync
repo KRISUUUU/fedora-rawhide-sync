@@ -2,7 +2,7 @@
 #
 # ==============================================================================
 # Project: Fedora Rawhide Sync Tool
-# Version: 9.0 (Enterprise Ready / Secure Edition)
+# Version: 9.1 (Enterprise Ready / Hotfix: DNF5 & Gum)
 # Author:  Krzysztof (GitHub: KRISUUUU)
 # License: MIT License
 # ==============================================================================
@@ -90,7 +90,8 @@ acquire_lock() {
 }
 
 detect_dnf_major() {
-    dnf --version 2>/dev/null | awk 'NR==1 { split($1, a, "."); print a[1]; exit }' || echo "4"
+    # Niezawodne wyciąganie cyfry głównej wersji dla DNF4 i DNF5
+    dnf --version 2>/dev/null | awk 'NR==1 {print $NF}' | cut -d. -f1 || echo "4"
 }
 
 check_disk_space() {
@@ -149,13 +150,11 @@ EOF
 
 ui_menu() {
     if [[ "$HAS_GUM" == "1" ]]; then
-        # Gum obsługuje renderowanie wewnętrznie
         local choice
         choice=$(gum choose --header="$(t menu_title)" \
             "1) $(t opt_1)" "2) $(t opt_2)" "3) $(t opt_3)" "4) $(t opt_4)" "L) $(t opt_L)" "5) $(t opt_5)")
         echo "${choice:0:1}"
     else
-        # FIX: Cały interfejs wypisujemy na stderr (>&2), aby na stdout poszedł tylko wynik (echo)
         echo -e " ${G}┌─ SAFE ZONE ──────────────────────────────────────────┐${NC}" >&2
         printf " ${G}│${NC}  ${W}[1]${NC} %-48s ${G}│${NC}\n" "$(t opt_1)" >&2
         printf " ${G}│${NC}  ${W}[2]${NC} %-48s ${G}│${NC}\n" "$(t opt_2)" >&2
@@ -189,7 +188,8 @@ ui_confirm() {
 ui_spinner() {
     local text="$1"; local command="$2"
     if [[ "$HAS_GUM" == "1" ]]; then
-        eval "$command" | gum spin --spinner dot --title "$text"
+        # Poprawna składnia dla gum spin
+        gum spin --spinner dot --title "$text" -- bash -c "$command"
     else
         echo -e "   ${Y}•${NC} $text" >&2
         eval "$command" > /dev/null
